@@ -19,10 +19,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package com.vagell.kv4pht.radio;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
@@ -37,6 +40,7 @@ import android.media.AudioManager;
 import android.media.AudioRecord;
 import android.media.AudioTrack;
 import android.os.Binder;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
@@ -85,6 +89,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -108,6 +113,8 @@ public class RadioAudioService extends Service {
     // Idx 0 matches https://www.amazon.com/gp/product/B08D5ZD528
     private static final int[] ESP32_VENDOR_IDS = {4292};
     private static final int[] ESP32_PRODUCT_IDS = {60000};
+
+    private static final String[] ESP32_BLUETOOTH_NAMES = {"kv4p-HT"};
 
     // Version related constants (also see FirmwareUtils for others)
     private static final String VERSION_PREFIX = "VERSION";
@@ -133,10 +140,18 @@ public class RadioAudioService extends Service {
     public static final int channelConfig = AudioFormat.CHANNEL_IN_MONO;
     public static final  int audioFormat = AudioFormat.ENCODING_PCM_8BIT;
     public static final  int minBufferSize = AudioRecord.getMinBufferSize(AUDIO_SAMPLE_RATE, channelConfig, audioFormat) * 4;
+
     private UsbManager usbManager;
-    private UsbDevice esp32Device;
-    private static UsbSerialPort serialPort;
+    private UsbDevice esp32DeviceUSB;
+    private static UsbSerialPort serialPortUSB;
     private SerialInputOutputManager usbIoManager;
+
+    private enum Connected { False, Pending, True }
+    private Connected connected = Connected.False;
+    private BluetoothAdapter bluetoothAdapter;
+    private BluetoothDevice esp32DeviceBT;
+    private BTSerialService serialServiceBT;
+
     private static final int TX_AUDIO_CHUNK_SIZE = 512; // Tx audio bytes to send to ESP32 in a single USB write
     private Map<String, Integer> mTones = new HashMap<>();
     private static final int MS_FOR_FINAL_TX_AUDIO_BEFORE_PTT_UP = 400;
@@ -575,7 +590,7 @@ public class RadioAudioService extends Service {
         activeFrequencyStr = frequencyStr;
         squelch = squelchLevel;
 
-        if (serialPort != null) {
+        if (serialPortUSB != null) {
             sendCommandToESP32(ESP32Command.TUNE_TO, makeSafe2MFreq(activeFrequencyStr) +
                     makeSafe2MFreq(activeFrequencyStr) + "0000" + squelchLevel +
                     (bandwidth.equals("Wide") ? "W" : "N"));
@@ -642,7 +657,7 @@ public class RadioAudioService extends Service {
         List<ChannelMemory> channelMemories = channelMemoriesLiveData.getValue();
         for (int i = 0; i < channelMemories.size(); i++) {
             if (channelMemories.get(i).memoryId == memoryId) {
-                if (serialPort != null) {
+                if (serialPortUSB != null) {
                     tuneToMemory(channelMemories.get(i), squelchLevel, forceTune);
                 }
             }
@@ -665,7 +680,7 @@ public class RadioAudioService extends Service {
         activeFrequencyStr = validateFrequency(memory.frequency);
         activeMemoryId = memory.memoryId;
 
-        if (serialPort != null) {
+        if (serialPortUSB != null) {
             sendCommandToESP32(ESP32Command.TUNE_TO,
                     getTxFreq(memory.frequency, memory.offset, memory.offsetKhz) + makeSafe2MFreq(memory.frequency) +
                             getToneIdxStr(memory.txTone) + getToneIdxStr(memory.rxTone) + squelchLevel +
@@ -741,7 +756,7 @@ public class RadioAudioService extends Service {
                         .build())
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .setBufferSizeInBytes(minBufferSize)
-                .setSessionId(AudioManager.AUDIO_SESSION_ID_GENERATE)
+                .setSessionId(AudioManager.AUDIO_SESSION_ID_GENERATE+1)
                 .build();
         audioTrack.setAuxEffectSendLevel(0.0f);
 
@@ -820,31 +835,68 @@ public class RadioAudioService extends Service {
         Log.d("DEBUG", "findESP32Device()");
 
         setMode(MODE_STARTUP);
-        esp32Device = null;
+        esp32DeviceUSB = null;
+        esp32DeviceBT = null;
 
         HashMap<String, UsbDevice> usbDevices = usbManager.getDeviceList();
 
         for (UsbDevice device : usbDevices.values()) {
             // Check for device's vendor ID and product ID
-            if (isESP32Device(device)) {
-                esp32Device = device;
+            if (isESP32DeviceUSB(device)) {
+                esp32DeviceUSB = device;
                 break;
             }
         }
 
-        if (esp32Device == null) {
-            Log.d("DEBUG", "No ESP32 detected");
-            if (callbacks != null) {
-                callbacks.radioMissing();
-            }
+        if (esp32DeviceUSB != null) {
+            Log.d("DEBUG", "Found USB ESP32.");
+            setupSerialConnectionUSB();
+            return;
         } else {
-            Log.d("DEBUG", "Found ESP32.");
-            setupSerialConnection();
+            Log.d("DEBUG", "No USB ESP32 detected...");
+        }
+
+        if(getPackageManager().hasSystemFeature(PackageManager.FEATURE_BLUETOOTH)) {
+            bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
+        }
+        if(bluetoothAdapter == null) {
+            Log.d("DEBUG", "No Bluetooth adapter!");
+            return;
+        }
+        if(!bluetoothAdapter.isEnabled()) {
+            Log.d("DEBUG", "Bluetooth adapter is not enabled!");
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if(checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED)
+                Log.d("DEBUG", "Bluetooth permission not granted!");
+               return;
+        }
+
+        for (BluetoothDevice device : bluetoothAdapter.getBondedDevices()) {
+            if (device.getType() != BluetoothDevice.DEVICE_TYPE_LE) {
+                if (isESP32DeviceBT(device)) {
+                    esp32DeviceBT = device;
+                    break;
+                }
+            }
+        }
+        if (esp32DeviceBT != null) {
+            Log.d("DEBUG", "Found BT ESP32.");
+            setupSerialConnectionBT();
+            return;
+        } else {
+            Log.d("DEBUG", "No BT ESP32 detected...");
+        }
+
+        if (callbacks != null) {
+            Log.d("DEBUG", "No radio found!");
+            callbacks.radioMissing();
         }
     }
 
-    private boolean isESP32Device(UsbDevice device) {
-        Log.d("DEBUG", "isESP32Device()");
+    private boolean isESP32DeviceUSB(UsbDevice device) {
+        Log.d("DEBUG", "isESP32DeviceUSB()");
 
         int vendorId = device.getVendorId();
         int productId = device.getProductId();
@@ -860,8 +912,22 @@ public class RadioAudioService extends Service {
         return false;
     }
 
-    public void setupSerialConnection() {
-        Log.d("DEBUG", "setupSerialConnection()");
+    @SuppressLint("MissingPermission")
+    private boolean isESP32DeviceBT(BluetoothDevice device) {
+        Log.d("DEBUG", "isESP32DeviceBT()");
+        String name = device.getName();
+        String address = device.getAddress();
+        Log.d("DEBUG", "name: " + name + " address: " + address);
+        for (int i = 0; i < ESP32_BLUETOOTH_NAMES.length; i++) {
+            if (name.equals(ESP32_BLUETOOTH_NAMES[i])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public void setupSerialConnectionUSB() {
+        Log.d("DEBUG", "setupSerialConnectionUSB()");
 
         // Find all available drivers from attached devices.
         UsbManager manager = (UsbManager) getSystemService(Context.USB_SERVICE);
@@ -885,11 +951,11 @@ public class RadioAudioService extends Service {
             return;
         }
 
-        serialPort = driver.getPorts().get(0); // Most devices have just one port (port 0)
-        Log.d("DEBUG", "serialPort: " + serialPort);
+        serialPortUSB = driver.getPorts().get(0); // Most devices have just one port (port 0)
+        Log.d("DEBUG", "serialPort: " + serialPortUSB);
         try {
-            serialPort.open(connection);
-            serialPort.setParameters(230400, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE);
+            serialPortUSB.open(connection);
+            serialPortUSB.setParameters(230400, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE);
         } catch (Exception e) {
             Log.d("DEBUG", "Error: couldn't open USB serial port.");
             if (callbacks != null) {
@@ -899,13 +965,13 @@ public class RadioAudioService extends Service {
         }
 
         try { // These settings needed for better data transfer on Adafruit QT Py ESP32-S2
-            serialPort.setRTS(true);
-            serialPort.setDTR(true);
+            serialPortUSB.setRTS(true);
+            serialPortUSB.setDTR(true);
         } catch (Exception e) {
             // Ignore, may not be supported on all devices.
         }
 
-        usbIoManager = new SerialInputOutputManager(serialPort, new SerialInputOutputManager.Listener() {
+        usbIoManager = new SerialInputOutputManager(serialPortUSB, new SerialInputOutputManager.Listener() {
             @Override
             public void onNewData(byte[] data) {
                 handleESP32Data(data);
@@ -913,10 +979,10 @@ public class RadioAudioService extends Service {
 
             @Override
             public void onRunError(Exception e) {
-                Log.d("DEBUG", "Error reading from ESP32.");
+                Log.d("DEBUG", "Error reading from USB ESP32.");
                 connection.close();
                 try {
-                    serialPort.close();
+                    serialPortUSB.close();
                 } catch (Exception ex) {
                     // Ignore.
                 }
@@ -933,7 +999,84 @@ public class RadioAudioService extends Service {
         usbIoManager.start();
         checkedFirmwareVersion = false;
 
-        Log.d("DEBUG", "Connected to ESP32.");
+        Log.d("DEBUG", "Connected to USB ESP32.");
+
+        // After a brief pause (to let it boot), do things with the ESP32 that we were waiting to do.
+        final Handler handler = new Handler(Looper.getMainLooper());
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (!checkedFirmwareVersion) {
+                    checkFirmwareVersion();
+                }
+            }
+        }, 3000);
+    }
+
+    public void setupSerialConnectionBT() {
+        Log.d("DEBUG", "setupSerialConnectionBT()");
+
+        try {
+            connected = Connected.Pending;
+            BTSerialSocket socket = new BTSerialSocket(getApplicationContext(), esp32DeviceBT);
+            serialServiceBT.connect(socket);
+        } catch (Exception e) {
+            Log.d("DEBUG", "Connection exception!");
+            connected = Connected.False;
+            serialServiceBT.disconnect();
+        }
+
+        serialServiceBT.attach(new BTSerialListener() {
+            @Override
+            public void onSerialConnect() {
+
+            }
+
+            @Override
+            public void onSerialConnectError(Exception e) {
+                Log.d("DEBUG", "Error connecting to BT ESP32.");
+                connected = Connected.False;
+                serialServiceBT.disconnect();
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException ex) {
+                    throw new RuntimeException(ex);
+                }
+                findESP32Device(); // Attempt to reconnect after the brief pause above.
+            }
+
+            @Override
+            public void onSerialRead(byte[] data) {
+                handleESP32Data(data);
+            }
+
+            @Override
+            public void onSerialRead(ArrayDeque<byte[]> datas) {
+                for (byte[] data : datas) {
+                    handleESP32Data(data);
+                }
+            }
+
+            @Override
+            public void onSerialIoError(Exception e) {
+                Log.d("DEBUG", "Error reading from BT ESP32.");
+                connected = Connected.False;
+                serialServiceBT.disconnect();
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException ex) {
+                    throw new RuntimeException(ex);
+                }
+                findESP32Device(); // Attempt to reconnect after the brief pause above.
+            }
+        });
+
+        //serialServiceBT.setWriteBufferSize(90000); // Must be large enough that ESP32 can take its time accepting our bytes without overrun.
+        //serialServiceBT.setReadTimeout(1000); // Must not be 0 (infinite) or it may block on read() until a write() occurs.
+        serialServiceBT.start();
+        checkedFirmwareVersion = false;
+
+        Log.d("DEBUG", "Connected to BT ESP32.");
 
         // After a brief pause (to let it boot), do things with the ESP32 that we were waiting to do.
         final Handler handler = new Handler(Looper.getMainLooper());
@@ -1225,7 +1368,7 @@ public class RadioAudioService extends Service {
             do {
                 try {
                     byte[] arrayPart = Arrays.copyOfRange(newBytes, bytesWritten, Math.min(bytesWritten + MAX_BYTES_PER_USB_WRITE, totalBytes));
-                    serialPort.write(arrayPart, 200);
+                    serialPortUSB.write(arrayPart, 200);
                     bytesWritten += MAX_BYTES_PER_USB_WRITE;
                     usbRetries = 0;
                 } catch (SerialTimeoutException ste) {
@@ -1238,7 +1381,7 @@ public class RadioAudioService extends Service {
         } catch (Exception e) {
             e.printStackTrace();
             try {
-                serialPort.close();
+                serialPortUSB.close();
             } catch (Exception ex) {
                 // Ignore. We did our best to close it!
             }
@@ -1255,7 +1398,7 @@ public class RadioAudioService extends Service {
     }
 
     public static UsbSerialPort getUsbSerialPort() {
-        return serialPort;
+        return serialPortUSB;
     }
 
     private void handleESP32Data(byte[] data) {
@@ -1266,6 +1409,7 @@ public class RadioAudioService extends Service {
                 Log.d("DEBUG", "Str data from ESP32: " + dataStr);
             } catch (UnsupportedEncodingException e) {
                 throw new RuntimeException(e);
+
             } */
         // Log.d("DEBUG", "Num bytes from ESP32: " + data.length);
 
@@ -1658,6 +1802,16 @@ public class RadioAudioService extends Service {
         }
 
         LocationManager lm = (LocationManager)getSystemService(Context.LOCATION_SERVICE);
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            // TODO: Consider calling
+            //    ActivityCompat#requestPermissions
+            // here to request the missing permissions, and then overriding
+            //   public void onRequestPermissionsResult(int requestCode, String[] permissions,
+            //                                          int[] grantResults)
+            // to handle the case where the user grants the permission. See the documentation
+            // for ActivityCompat#requestPermissions for more details.
+            return;
+        }
         Location location = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER); // Try to get cached location (fast)
 
         if (location == null) {
