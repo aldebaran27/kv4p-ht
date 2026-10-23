@@ -24,6 +24,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.bluetooth.BluetoothDevice;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
@@ -202,6 +203,9 @@ public class RadioAudioService extends Service {
     // === USB / Serial ===
     private UsbManager usbManager;
     private RadioTransport activeTransport;
+    // When a paired radio is in range over Classic Bluetooth, try SPP first; if that attempt
+    // fails, the next reconcile tick tries BLE, so a BLE-only radio still connects.
+    private boolean preferClassicBluetoothNext = true;
     private boolean usbPermissionRequestPending = false;
     @Getter
     private Protocol.Sender hostToEsp32;
@@ -1185,7 +1189,8 @@ public class RadioAudioService extends Service {
             return;
         }
         if (device.isPresent()) {
-            if (activeTransport instanceof BleKissRadioTransport) {
+            if (activeTransport != null && !(activeTransport instanceof UsbSerialRadioTransport)) {
+                // A cable takes priority over a Bluetooth link that is still connecting.
                 closePortAndReset();
             }
             setMode(RadioMode.STARTUP);
@@ -1199,8 +1204,16 @@ public class RadioAudioService extends Service {
             setMode(RadioMode.STARTUP);
             clearRadioTypeAndLimits();
             notifyRadioMissing();
-            Log.d(TAG, connectLog("reconcileConnections(): no USB device; starting BLE discovery"));
-            attemptBleConnect();
+            BluetoothDevice pairedRadio = ClassicBluetoothRadioTransport.findBondedRadio(this);
+            if (pairedRadio != null && preferClassicBluetoothNext) {
+                preferClassicBluetoothNext = false;
+                Log.d(TAG, connectLog("reconcileConnections(): no USB device; connecting to paired radio over Bluetooth SPP"));
+                attemptClassicBluetoothConnect(pairedRadio);
+            } else {
+                preferClassicBluetoothNext = true;
+                Log.d(TAG, connectLog("reconcileConnections(): no USB device; starting BLE discovery"));
+                attemptBleConnect();
+            }
         }
     }
 
@@ -1282,6 +1295,12 @@ public class RadioAudioService extends Service {
         transport.start(createTransportListener(transport));
     }
 
+    private void attemptClassicBluetoothConnect(BluetoothDevice pairedRadio) {
+        RadioTransport transport = new ClassicBluetoothRadioTransport(this, handler, pairedRadio);
+        activeTransport = transport;
+        transport.start(createTransportListener(transport));
+    }
+
     private void attemptBleConnect() {
         RadioTransport transport = new BleKissRadioTransport(this, handler);
         activeTransport = transport;
@@ -1301,6 +1320,10 @@ public class RadioAudioService extends Service {
                     return;
                 }
                 callbacks.hideSnackBar();
+                if (transport instanceof ClassicBluetoothRadioTransport) {
+                    // Reconnect over SPP first next time this link drops.
+                    preferClassicBluetoothNext = true;
+                }
                 hostToEsp32 = new Protocol.Sender(transport::writeAsync);
                 radioModule.attachSender(hostToEsp32);
                 Log.i(TAG, connectLog(transport.getName() + " connected; starting handshake"));

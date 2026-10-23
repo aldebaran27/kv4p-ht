@@ -4,6 +4,22 @@
 
 The KV4P-HT protocol defines the communication interface between the microcontroller and external systems. It specifies message structures and command types for data exchange.
 
+## Transports
+
+The same protocol (control, live RX audio, TX voice, and AX.25) runs over three links at once. Each link is an independent session with its own flow-control window.
+
+| Link | How the host connects | Window |
+| --- | --- | --- |
+| USB serial | CDC/UART at 115200 baud. Required for firmware flashing. | 2048 bytes |
+| Classic Bluetooth SPP | Pair `kv4p-XXXXXX` in the phone's Bluetooth settings, then open an RFCOMM socket to the Serial Port Profile UUID `00001101-0000-1000-8000-00805F9B34FB`. | 2048 bytes |
+| BLE KISS | GATT service `00000001-ba2a-46c9-ae49-01b0961f68bb`; subscribe to notifications to start the session. | 4096 bytes |
+
+`kv4p-XXXXXX` is derived from the board's Bluetooth MAC. On SPP the firmware sends `COMMAND_HELLO` as soon as a client connects, so the host should be ready to parse it before writing anything.
+
+The Arduino `BluetoothSerial` receive queue is only 512 bytes and drops overflow silently, which is smaller than the 2048-byte window. The firmware therefore reads SPP data through `btSppStream.h`, which copies it into a 4096-byte lock-free ring so a full window of TX voice frames is never lost. Overflow, if it ever happens, is logged as a warning.
+
+The Android app picks a link automatically: USB when a cable is attached, otherwise a paired `kv4p-` radio over SPP, otherwise BLE. If an SPP attempt fails it tries BLE next, then alternates.
+
 ## Protocol Changelog
 
 ### v2.0.0.2 (Unreleased, FW: 17)
@@ -259,7 +275,7 @@ A window-based flow control mechanism, inspired by HTTP/2, is used to regulate t
 1. **Window Size Declaration**:
 
    * The ESP32 sends a "desired" initial window size in the `COMMAND_HELLO` payload.
-   * This typically matches the size of its internal USB receive buffer.
+   * This typically matches the size of the receive buffer for that link (USB, Bluetooth SPP, or BLE).
 
 2. **Window Consumption**:
 

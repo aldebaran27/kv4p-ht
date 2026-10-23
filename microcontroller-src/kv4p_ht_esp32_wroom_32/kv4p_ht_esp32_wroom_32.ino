@@ -24,6 +24,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "globals.h"
 #include "debug.h"
 #include "BluedroidBleKissGattStream.h"
+#include "btSppStream.h"
 #include "led.h"
 #include "protocol.h"
 #include "state.h"
@@ -40,6 +41,11 @@ const uint32_t RSSI_REPORT_INTERVAL_MS = 100;
 const uint32_t DEVICE_STATE_REPORT_INTERVAL_MS = 500;
 const uint16_t USB_BUFFER_SIZE = 1024*2;
 const uint16_t BLE_KISS_WINDOW_SIZE = 4096;
+// Classic Bluetooth SPP: the RX ring is twice the advertised flow-control
+// window so a full window of host frames always fits while the parser catches up.
+const uint16_t BT_SPP_WINDOW_SIZE = 1024*2;
+const size_t BT_SPP_RX_BUFFER_SIZE = 1024*4;
+static_assert(BT_SPP_RX_BUFFER_SIZE >= 2 * BT_SPP_WINDOW_SIZE, "SPP RX ring must hold a full window with margin");
 
 using Kv4pBleKissStream = BluedroidBleKissGattStream<4096, 512, 32>;
 
@@ -62,6 +68,8 @@ DRA818 sa818_vhf(&Serial2, SA818_VHF);
 DRA818 sa818_uhf(&Serial2, SA818_UHF);
 DRA818 &sa818 = sa818_vhf;
 BluetoothSerial SerialBT;
+BtSppStream<BT_SPP_RX_BUFFER_SIZE> btSppStream(SerialBT);
+uint32_t btSppReportedDroppedBytes = 0;
 Kv4pBleKissStream bleKissStream(bleKissConfig());
 bool bluetoothStarted = false;
 bool bluetoothProtocolConnected = false;
@@ -389,10 +397,12 @@ void setup() {
   Serial.println("==============================");
   char bluetoothDeviceName[12];
   formatBluetoothDeviceName(bluetoothDeviceName, sizeof(bluetoothDeviceName));
-  bluetoothStarted = SerialBT.begin(bluetoothDeviceName);
+  bluetoothStarted = btSppStream.begin(bluetoothDeviceName);
   if (bluetoothStarted) {
-    protocolBtSession.stream = &SerialBT;
-    protocolBtSession.windowSize = USB_BUFFER_SIZE;
+    protocolBtSession.stream = &btSppStream;
+    protocolBtSession.windowSize = BT_SPP_WINDOW_SIZE;
+    Serial.print("Classic Bluetooth SPP discoverable as ");
+    Serial.println(bluetoothDeviceName);
   } else {
     Serial.println("Classic Bluetooth init failed");
   }
@@ -682,11 +692,13 @@ void bluetoothLoop() {
     return;
   }
 
-  bool connected = SerialBT.hasClient();
+  bool connected = btSppStream.hasClient();
   if (connected && !bluetoothProtocolConnected) {
     bluetoothProtocolConnected = true;
     protocolBtSession.connected = true;
+    btSppStream.resetRx();
     bluetoothParser.reset();
+    _LOGI("Classic Bluetooth SPP client connected; sending HELLO");
     sendHello(protocolBtSession, FIRMWARE_VER, radioModuleStatus, hw.rfModuleType, moduleMinRadioFreq(), moduleMaxRadioFreq(), getFirmwareFeatures(), currentDeviceState(protocolBtSession.flags));
   } else if (!connected && bluetoothProtocolConnected) {
     bluetoothProtocolConnected = false;
@@ -701,6 +713,12 @@ void bluetoothLoop() {
 
   if (bluetoothProtocolConnected) {
     bluetoothParser.loop();
+  }
+
+  uint32_t dropped = btSppStream.droppedRxBytes();
+  if (dropped != btSppReportedDroppedBytes) {
+    _LOGW("Classic Bluetooth SPP RX ring overflow: %u bytes dropped in total", (unsigned)dropped);
+    btSppReportedDroppedBytes = dropped;
   }
 }
 

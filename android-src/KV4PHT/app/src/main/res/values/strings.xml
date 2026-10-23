@@ -79,7 +79,7 @@
     <string name="delete">Delete</string>
     <string name="simplex">Simplex</string>
     <string name="memory_menu">Memory menu</string>
-    <string name="radio_not_found">kv4p HT radio not found, plugged in?</string>
+    <string name="radio_not_found">kv4p HT radio not found. Plug in USB, or pair it in Bluetooth settings.</string>
     <string name="handshake_message">Looking for kv4p HT radio...</string>
     <string name="module_not_found_message">Radio module not responding to ESP32, check PCB solder joints</string>
     <string name="no_firmware_installed">No firmware installed</string>
