@@ -129,7 +129,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          previous_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          # On a 404 (e.g. a fork with no releases) gh prints the error body to stdout,
+          # so only trust the output when the call succeeds.
+          previous_tag=""
+          if latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null)"; then
+            previous_tag="$latest_tag"
+          fi
+          if [[ "$previous_tag" == "nightly" || "$previous_tag" == "null" ]]; then
+            previous_tag=""
+          fi
           if [[ -z "$previous_tag" ]]; then
             previous_tag="$(git tag --sort=-version:refname | grep -v '^nightly$' | head -n 1 || true)"
           fi
@@ -144,7 +152,9 @@ jobs:
               -f previous_tag_name="$previous_tag" \
               --jq .body > generated-notes.md
           else
-            git log --first-parent --pretty='format:* %s (%h)' > generated-notes.md
+            # No earlier release to diff against: list recent commits only, so the
+            # notes stay well under GitHub's release body size limit.
+            git log --first-parent --max-count=50 --pretty='format:* %s (%h)' > generated-notes.md
           fi
 
           short_sha="${GITHUB_SHA::7}"
